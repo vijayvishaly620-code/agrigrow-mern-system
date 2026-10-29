@@ -23,8 +23,10 @@ import {
   ChevronLeft,
   ChevronRight,
   Leaf,
-  Scissors
+  Scissors,
+  Database
 } from 'lucide-react';
+import { api } from './services/api.js';
 
 // Initial Mock Data (South Indian Crops)
 const INITIAL_CROPS = [
@@ -51,6 +53,7 @@ const INITIAL_PRODUCTION = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [dbStatus, setDbStatus] = useState('checking'); // 'checking' | 'connected' | 'offline'
 
   // Core Data States
   const [crops, setCrops] = useState(() => {
@@ -67,6 +70,36 @@ export default function App() {
     const saved = localStorage.getItem('production');
     return saved ? JSON.parse(saved) : INITIAL_PRODUCTION;
   });
+
+  // Sync from MongoDB on initial mount
+  useEffect(() => {
+    let isMounted = true;
+    async function initData() {
+      try {
+        const health = await api.checkHealth();
+        if (health.online && health.database === 'connected') {
+          if (isMounted) setDbStatus('connected');
+          const [backendCrops, backendCultivations, backendProduction] = await Promise.all([
+            api.getCrops(),
+            api.getCultivations(),
+            api.getProduction(),
+          ]);
+          if (isMounted) {
+            if (backendCrops && backendCrops.length > 0) setCrops(backendCrops);
+            if (backendCultivations && backendCultivations.length > 0) setCultivations(backendCultivations);
+            if (backendProduction && backendProduction.length > 0) setProduction(backendProduction);
+          }
+        } else {
+          if (isMounted) setDbStatus('offline');
+        }
+      } catch (err) {
+        console.warn('Backend not accessible, operating in local storage mode:', err.message);
+        if (isMounted) setDbStatus('offline');
+      }
+    }
+    initData();
+    return () => { isMounted = false; };
+  }, []);
 
   // Simulator States
   const [weather, setWeather] = useState('Sunny');
@@ -173,16 +206,35 @@ export default function App() {
     return { totalHarvestedWeight, totalRevenue, activePlotsCount, expectedYield };
   }, [crops, cultivations, production]);
 
-  const handleAddCropSubmit = (e) => {
+  const handleAddCropSubmit = async (e) => {
     e.preventDefault();
     if (!newCrop.name) return;
-    const cropId = (crops.length + 1).toString();
-    setCrops([...crops, { id: cropId, ...newCrop, duration: Number(newCrop.duration), yieldExpect: Number(newCrop.yieldExpect), marketVal: Number(newCrop.marketVal) }]);
+    const payload = {
+      ...newCrop,
+      duration: Number(newCrop.duration),
+      yieldExpect: Number(newCrop.yieldExpect),
+      marketVal: Number(newCrop.marketVal)
+    };
+
+    if (dbStatus === 'connected') {
+      try {
+        const savedCrop = await api.addCrop(payload);
+        setCrops(prev => [...prev, savedCrop]);
+      } catch (err) {
+        console.error('Failed to save to backend:', err);
+        const cropId = (crops.length + 1).toString();
+        setCrops(prev => [...prev, { id: cropId, ...payload }]);
+      }
+    } else {
+      const cropId = (crops.length + 1).toString();
+      setCrops(prev => [...prev, { id: cropId, ...payload }]);
+    }
+
     setNewCrop({ name: '', sciName: '', type: 'Grain', ph: '6.0 - 7.0', water: 'Daily', temp: '20°C - 30°C', duration: 90, yieldExpect: 5.0, marketVal: 1.50 });
     setShowAddCrop(false);
   };
 
-  const handlePlantCropSubmit = (e) => {
+  const handlePlantCropSubmit = async (e) => {
     e.preventDefault();
     if (!newPlant.cropId || !newPlant.location) return;
     const cropRef = crops.find(c => c.id === newPlant.cropId);
@@ -192,9 +244,7 @@ export default function App() {
     plantDateObj.setDate(plantDateObj.getDate() + Number(cropRef.duration));
     const expectedHarvest = plantDateObj.toISOString().split('T')[0];
 
-    const logId = `log-${Date.now()}`;
-    const newCultivation = {
-      id: logId,
+    const payload = {
       cropId: newPlant.cropId,
       cropName: cropRef.name,
       location: newPlant.location,
@@ -205,44 +255,79 @@ export default function App() {
       logs: ['Initial sowing logged successfully']
     };
 
-    setCultivations([newCultivation, ...cultivations]);
+    if (dbStatus === 'connected') {
+      try {
+        const savedPlot = await api.addCultivation(payload);
+        setCultivations(prev => [savedPlot, ...prev]);
+      } catch (err) {
+        console.error('Failed to plant plot on backend:', err);
+        const logId = `log-${Date.now()}`;
+        setCultivations(prev => [{ id: logId, ...payload }, ...prev]);
+      }
+    } else {
+      const logId = `log-${Date.now()}`;
+      setCultivations(prev => [{ id: logId, ...payload }, ...prev]);
+    }
+
     setNewPlant({ cropId: '', location: '', plantedDate: new Date().toISOString().split('T')[0] });
     setShowPlantCrop(false);
     setActiveTab('cultivations');
   };
 
-  const advanceStage = (id) => {
+  const advanceStage = async (id) => {
     const stages = ['Planted', 'Germination', 'Vegetative', 'Flowering', 'Ready to Harvest'];
-    setCultivations(cultivations.map(c => {
-      if (c.id === id) {
-        const currentIndex = stages.indexOf(c.stage);
-        if (currentIndex < stages.length - 1) {
-          const nextStage = stages[currentIndex + 1];
+    const current = cultivations.find(c => c.id === id);
+    if (!current) return;
+    const currentIndex = stages.indexOf(current.stage);
+    if (currentIndex < stages.length - 1) {
+      const nextStage = stages[currentIndex + 1];
+      const logMsg = `Growth stage progressed manually to: ${nextStage}`;
+
+      if (dbStatus === 'connected') {
+        try {
+          await api.updateCultivation(id, { stage: nextStage, logMessage: logMsg });
+        } catch (err) {
+          console.error('Failed to update stage on backend:', err);
+        }
+      }
+
+      setCultivations(cultivations.map(c => {
+        if (c.id === id) {
           return {
             ...c,
             stage: nextStage,
-            logs: [`Growth stage progressed manually to: ${nextStage}`, ...c.logs]
+            logs: [logMsg, ...c.logs]
           };
         }
-      }
-      return c;
-    }));
+        return c;
+      }));
+    }
   };
 
-  const logAction = (id, actionType) => {
+  const logAction = async (id, actionType) => {
     const today = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const logMsg = `Logged ${actionType} action at ${today}`;
+
+    if (dbStatus === 'connected') {
+      try {
+        await api.updateCultivation(id, { logMessage: logMsg });
+      } catch (err) {
+        console.error('Failed to log action on backend:', err);
+      }
+    }
+
     setCultivations(cultivations.map(c => {
       if (c.id === id) {
         return {
           ...c,
-          logs: [`Logged ${actionType} action at ${today}`, ...c.logs]
+          logs: [logMsg, ...c.logs]
         };
       }
       return c;
     }));
   };
 
-  const executeHarvest = (e) => {
+  const executeHarvest = async (e) => {
     e.preventDefault();
     const activeLog = cultivations.find(c => c.id === showHarvestModal);
     if (!activeLog) return;
@@ -250,9 +335,8 @@ export default function App() {
     const unitPrice = cropRef ? cropRef.marketVal : 1.0;
     const calculatedRevenue = Math.round(harvestInput.quantity * unitPrice);
 
-    const prodId = `prod-${Date.now()}`;
-    const newRecord = {
-      id: prodId,
+    const harvestLogMsg = `Harvest complete: Received ${harvestInput.quantity} kg (Grade ${harvestInput.grade})`;
+    const prodPayload = {
       cropName: activeLog.cropName,
       location: activeLog.location,
       harvestDate: new Date().toISOString().split('T')[0],
@@ -261,7 +345,24 @@ export default function App() {
       revenue: calculatedRevenue
     };
 
-    setProduction([newRecord, ...production]);
+    if (dbStatus === 'connected') {
+      try {
+        const savedProd = await api.addProduction(prodPayload);
+        setProduction(prev => [savedProd, ...prev]);
+        await api.updateCultivation(activeLog.id, {
+          status: 'Harvested',
+          stage: 'Harvested',
+          logMessage: harvestLogMsg
+        });
+      } catch (err) {
+        console.error('Failed to record harvest on backend:', err);
+        const prodId = `prod-${Date.now()}`;
+        setProduction(prev => [{ id: prodId, ...prodPayload }, ...prev]);
+      }
+    } else {
+      const prodId = `prod-${Date.now()}`;
+      setProduction(prev => [{ id: prodId, ...prodPayload }, ...prev]);
+    }
 
     setCultivations(cultivations.map(c => {
       if (c.id === showHarvestModal) {
@@ -269,7 +370,7 @@ export default function App() {
           ...c,
           status: 'Harvested',
           stage: 'Harvested',
-          logs: [`Harvest complete: Recieved ${harvestInput.quantity} kg (Grade ${harvestInput.grade})`, ...c.logs]
+          logs: [harvestLogMsg, ...c.logs]
         };
       }
       return c;
@@ -383,7 +484,30 @@ export default function App() {
             </p>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.35rem',
+              padding: '0.25rem 0.6rem',
+              borderRadius: '50px',
+              fontSize: '0.7rem',
+              fontWeight: '600',
+              background: dbStatus === 'connected' ? 'rgba(16, 185, 129, 0.12)' : dbStatus === 'checking' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+              border: `1px solid ${dbStatus === 'connected' ? 'rgba(16, 185, 129, 0.3)' : dbStatus === 'checking' ? 'rgba(59, 130, 246, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`,
+              color: dbStatus === 'connected' ? 'var(--color-brand)' : dbStatus === 'checking' ? '#60a5fa' : 'var(--color-accent)'
+            }}>
+              <span style={{
+                width: '6px',
+                height: '6px',
+                borderRadius: '50%',
+                backgroundColor: dbStatus === 'connected' ? 'var(--color-brand)' : dbStatus === 'checking' ? '#60a5fa' : 'var(--color-accent)',
+                boxShadow: dbStatus === 'connected' ? '0 0 6px var(--color-brand)' : 'none'
+              }} />
+              <Database size={11} />
+              <span>{dbStatus === 'connected' ? 'MongoDB Connected' : dbStatus === 'checking' ? 'Checking DB...' : 'Local Storage Mode'}</span>
+            </div>
+
             <button className="btn-primary" style={{ background: 'linear-gradient(135deg, var(--color-accent), #d97706)', gap: '0.35rem' }} onClick={simulateGrowthDay}>
               <Play size={12} fill="white" /> Simulate 1 Day
             </button>
